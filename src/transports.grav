@@ -1,0 +1,134 @@
+// transports.grav — how mail leaves: SMTP (std's client), a log (a file or a
+// function), an array (memory: tests and previews), sendmail, and the
+// failover and round-robin transports over several others.
+import "std"
+import "std/net"
+import "apogee-support"
+import "mailable.grav"
+
+namespace apogee {
+
+    interface MailTransport {
+        // Sends it; an id for the message (its Message-ID where there is one).
+        fn send(mail: RenderedMail) -> string
+        fn name() -> string
+    }
+
+    class SmtpTransport implements MailTransport {
+        public host: string
+        public port: int
+        public username: string = ""
+        public password: string = ""
+        // "starttls", "tls" or "none" ("" for the port's usual one).
+        public security: string = ""
+        public timeoutMs: int = 30000
+        constructor(host: string, port: int = 587) { self.host = host; self.port = port; }
+        // smtp://user:pass@host:587?security=none
+        static fn fromUrl(url: string) -> SmtpTransport {
+            let u = Url.parse(url);
+            let t = new SmtpTransport(u.host, u.port > 0 && u.port != 80 ? u.port : (u.scheme == "smtps" ? 465 : 587));
+            t.username = u.user;
+            t.password = u.password;
+            let sec = u.queryValue("security");
+            if (sec != "") { t.security = sec; }
+            if (u.scheme == "smtps") { t.security = "tls"; }
+            return t;
+        }
+        fn name() -> string { return "smtp"; }
+        fn send(mail: RenderedMail) -> string {
+            let c = new SmtpClient(self.host, self.port);
+            if (self.security != "") { c.withSecurity(self.security); }
+            c.timeoutMs = self.timeoutMs;
+            if (self.username != "") { c.login(self.username, self.password); }
+            let id = "<" + Text.random(24) + "@" + (mail.from == null ? "localhost" : Text.after(mail.from.email, "@")) + ">";
+            let e = mail.toEmail();
+            e.header("Message-ID", id);
+            c.send(e);
+            return id;
+        }
+    }
+
+    // Writes each mail (its MIME text) to a file, or hands it to a function: development.
+    class LogTransport implements MailTransport {
+        public path: string
+        private sink: fn(string) = null
+        private lock: Mutex
+        constructor(path: string = "") { self.path = path; self.lock = new Mutex(); }
+        static fn to(sink: fn(string)) -> LogTransport { let t = new LogTransport(""); t.sink = sink; return t; }
+        fn name() -> string { return "log"; }
+        fn send(mail: RenderedMail) -> string {
+            let entry = "[" + Moment.now().toDateTimeString() + "] Mail to " + Str.join(Mailer.emails(mail.to), ", ") + ": " + mail.subject + "\n" + mail.toMime() + "\n\n";
+            if (self.sink != null) { self.sink(entry); return Text.ulid(); }
+            self.lock.lock();
+            try {
+                let f = new File(self.path);
+                if (f.exists()) { f.append(entry); } else { f.write(entry); }
+            } finally { self.lock.unlock(); }
+            return Text.ulid();
+        }
+    }
+
+    // Keeps every mail in memory (tests, previews, and the fake).
+    class ArrayTransport implements MailTransport {
+        public sent: Array<RenderedMail>
+        private lock: Mutex
+        constructor() { self.sent = new Array<RenderedMail>(); self.lock = new Mutex(); }
+        fn name() -> string { return "array"; }
+        fn send(mail: RenderedMail) -> string { self.lock.lock(); self.sent.push(mail); self.lock.unlock(); return "array-${self.sent.size()}"; }
+        fn messages() -> Array<RenderedMail> { self.lock.lock(); let out = self.sent.copy(); self.lock.unlock(); return out; }
+        fn flush() { self.lock.lock(); self.sent = new Array<RenderedMail>(); self.lock.unlock(); }
+    }
+
+    // Through the local sendmail program (`sendmail -t -i`).
+    class SendmailTransport implements MailTransport {
+        public command: string
+        constructor(command: string = "/usr/sbin/sendmail -t -i") { self.command = command; }
+        fn name() -> string { return "sendmail"; }
+        fn send(mail: RenderedMail) -> string {
+            let file = Path.combine(Dir.temp(), "apogee-mail-" + Text.random(12) + ".eml");
+            new File(file).write(mail.toMime());
+            let r = Process.run(self.command + " < '" + file + "' 2>&1");
+            new File(file).delete();
+            if (r.code != 0) { throw new MailException("sendmail failed (exit ${r.code}): " + Str.trim(r.output)); }
+            return Text.ulid();
+        }
+    }
+
+    // Tries each transport in turn until one sends (a backup SMTP server).
+    class FailoverTransport implements MailTransport {
+        public transports: Array<MailTransport>
+        constructor(transports: Array<MailTransport>) { self.transports = transports; }
+        fn name() -> string { return "failover"; }
+        fn send(mail: RenderedMail) -> string {
+            let errors = new Array<string>();
+            for (t in self.transports) {
+                try { return t.send(mail); } catch (e: Exception) { errors.push(t.name() + ": " + e.message()); }
+            }
+            throw new MailException("every transport failed: " + Str.join(errors, "; "));
+        }
+    }
+
+    // Spreads mail over several transports, one after another (then failover among them).
+    class RoundRobinTransport implements MailTransport {
+        public transports: Array<MailTransport>
+        private next: AtomicInt
+        constructor(transports: Array<MailTransport>) { self.transports = transports; self.next = new AtomicInt(0); }
+        fn name() -> string { return "roundrobin"; }
+        fn send(mail: RenderedMail) -> string {
+            let n = self.transports.size();
+            if (n == 0) { throw new MailException("no transports"); }
+            let start = ((self.next.increment() - 1) % (n as long)) as int;
+            let errors = new Array<string>();
+            for (k in 0..n) {
+                let t = self.transports[(start + k) % n];
+                try { return t.send(mail); } catch (e: Exception) { errors.push(t.name() + ": " + e.message()); }
+            }
+            throw new MailException("every transport failed: " + Str.join(errors, "; "));
+        }
+    }
+
+    class MailException extends Exception {
+        constructor(message: string) { super(message); }
+        public fn kind() -> string { return "MailException"; }
+    }
+}
