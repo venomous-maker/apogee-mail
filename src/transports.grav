@@ -5,6 +5,7 @@ import "std"
 import "std/net"
 import "apogee-support"
 import "mailable.grav"
+import "mailer.grav"
 
 namespace apogee {
 
