@@ -1,0 +1,272 @@
+// mailer.grav — Mailer: renders mailables and sends them through a
+// transport, now or on the queue; MailManager: several mailers by name.
+//
+//   let mailer = new Mailer("smtp", SmtpTransport.fromUrl("smtp://user:pass@smtp.example.com:587"), container)
+//   mailer.alwaysFrom = Address.parse("Shop <hello@shop.test>")
+//   mailer.views = viewFactory                      // for view()/markdown views
+//   mailer.to("ada@example.com").send(new OrderShipped(42))
+//   mailer.to("ada@example.com").queue(new OrderShipped(42))          // a SendQueuedMailable job (mailer.queueManager)
+//   mailer.fake(); …; mailer.assertSent::<OrderShipped>(fn(m: OrderShipped) -> bool { return m.hasTo("ada@example.com") })
+import "std"
+import "apogee-support"
+import "apogee-container"
+import "apogee-events"
+import "apogee-queue"
+import "apogee-view"
+import "markdown.grav"
+import "mailable.grav"
+import "transports.grav"
+
+namespace apogee {
+
+    // Before a mail goes out: a listener may change it, or cancel it.
+    class MessageSending {
+        public mail: RenderedMail
+        public cancelled: bool = false
+        constructor(mail: RenderedMail) { self.mail = mail; }
+        fn cancel() { self.cancelled = true; }
+    }
+    class MessageSent {
+        public mail: RenderedMail
+        public id: string
+        constructor(mail: RenderedMail, id: string) { self.mail = mail; self.id = id; }
+    }
+
+    // What send() gives back.
+    class SentMessage {
+        public id: string
+        public mail: RenderedMail
+        constructor(id: string, mail: RenderedMail) { self.id = id; self.mail = mail; }
+    }
+
+    class Mailer {
+        public name: string
+        public transport: MailTransport
+        public container: Container
+        public views: ViewFactory = null
+        public theme: MailTheme
+        public events: Events = null
+        public queueManager: QueueManager = null
+        // Defaults for every mail it sends.
+        public alwaysFrom: Address = null
+        public alwaysReplyTo: Address = null
+        // Every mail goes here instead (development: no customer gets a test mail).
+        public alwaysTo: Address = null
+        private faking: bool = false
+        private sentMails: Array<Mailable>
+        private queuedMails: Array<Mailable>
+        private lock: Mutex
+
+        constructor(name: string, transport: MailTransport, container: Container) {
+            self.name = name; self.transport = transport; self.container = container;
+            self.theme = new MailTheme();
+            self.sentMails = new Array<Mailable>();
+            self.queuedMails = new Array<Mailable>();
+            self.lock = new Mutex();
+        }
+
+        // ── sending ────────────────────────────────────────────────────────────
+        fn to(address: string, name: string = "") -> PendingMail { return new PendingMail(self).to(address, name); }
+        fn cc(address: string) -> PendingMail { return new PendingMail(self).cc(address); }
+        fn bcc(address: string) -> PendingMail { return new PendingMail(self).bcc(address); }
+        // Renders and sends it now.
+        fn send(m: Mailable) -> SentMessage {
+            if (self.faking) { self.lock.lock(); self.sentMails.push(m); self.lock.unlock(); self.ensureBuilt(m); return new SentMessage("fake", self.render(m)); }
+            let mail = self.render(m);
+            if (self.events != null) {
+                let e = new MessageSending(mail);
+                self.events.dispatch(e);
+                if (e.cancelled) { return new SentMessage("", mail); }
+            }
+            let id = self.transport.send(mail);
+            if (self.events != null) { self.events.dispatch(new MessageSent(mail, id)); }
+            return new SentMessage(id, mail);
+        }
+        // Sends it from a worker (the queue's SendQueuedMailable job); the job's id.
+        fn queue(m: Mailable) -> string {
+            if (self.faking) { self.lock.lock(); self.queuedMails.push(m); self.lock.unlock(); return "fake"; }
+            if (self.queueManager == null) { self.send(m); return "sync"; }
+            let job = new SendQueuedMailable();
+            job.mailable = m;
+            job.mailerName = self.name;
+            if (m.queueName != "") { job.queueName = m.queueName; }
+            if (m.connectionName != "") { job.connectionName = m.connectionName; }
+            job.delaySeconds = m.delaySeconds;
+            return self.queueManager.dispatch(job);
+        }
+        fn later(seconds: long, m: Mailable) -> string { m.delaySeconds = seconds; return self.queue(m); }
+        // A quick mail without a class.
+        fn raw(to: string, subject: string, text: string) -> SentMessage {
+            let m = new RawMail();
+            m.to(to);
+            m.subject(subject);
+            m.text(text);
+            return self.send(m);
+        }
+
+        // ── rendering ──────────────────────────────────────────────────────────
+        private fn ensureBuilt(m: Mailable) {
+            if (m.built) { return; }
+            m.built = true;
+            self.container.call(m, "build");
+        }
+        // The mail it would send: addresses, subject, HTML and text parts, attachments.
+        fn render(m: Mailable) -> RenderedMail {
+            self.ensureBuilt(m);
+            let r = new RenderedMail();
+            r.mailable = ClassInfo.of(m).name;
+            r.from = m.fromAddress != "" ? Address.parse(m.fromAddress) : self.alwaysFrom;
+            if (r.from == null) { throw new MailException("the mail has no From address (set the mailer's alwaysFrom)"); }
+            if (self.alwaysTo != null) { r.to.push(self.alwaysTo); }
+            else { r.to = Mailable.addresses(m.toList); r.cc = Mailable.addresses(m.ccList); r.bcc = Mailable.addresses(m.bccList); }
+            if (r.to.size() == 0 && r.cc.size() == 0 && r.bcc.size() == 0) { throw new MailException(r.mailable + " has no recipients"); }
+            if (m.replyToList.size() > 0) { r.replyTo = Mailable.addresses(m.replyToList); }
+            else if (self.alwaysReplyTo != null) { r.replyTo.push(self.alwaysReplyTo); }
+            r.subject = m.subjectLine != "" ? m.subjectLine : Text.headline(ClassInfo.of(m).simpleName());
+            let data = new HashMap<string, any>();
+            for (k in m.viewData.keys()) { data.put(k, m.viewData[k]); }
+            data.put("subject", r.subject);
+            if (m.viewName != "") { r.html = self.needViews().render(m.viewName, data); }
+            else if (m.htmlBody != "") { r.html = m.htmlBody; }
+            if (m.textViewName != "") { r.text = self.needViews().render(m.textViewName, data); }
+            else if (m.textBody != "") { r.text = m.textBody; }
+            let md = m.markdownBody;
+            if (m.markdownView != "") { md = self.needViews().render(m.markdownView, data); }
+            else if (md != "" && self.views != null && Str.contains(md, "{{")) { md = self.views.renderString(md, data); }
+            if (md != "") {
+                if (r.html == "") { r.html = self.theme.render(md, r.subject); }
+                if (r.text == "") { r.text = self.theme.text(md); }
+            }
+            if (r.text == "" && r.html != "") { r.text = Mailer.htmlToText(r.html); }
+            r.attachments = m.attachments();
+            r.headers = m.headerMap;
+            r.tags = m.tagList.copy();
+            r.metadata = m.metadataMap;
+            return r;
+        }
+        // The HTML of a mailable (a route can show it while designing mail).
+        fn preview(m: Mailable) -> string { let r = self.render(m); return r.html != "" ? r.html : "<pre>" + Markdown.escape(r.text) + "</pre>"; }
+        private fn needViews() -> ViewFactory {
+            if (self.views == null) { throw new MailException("this mail uses a view: set the mailer's views"); }
+            return self.views;
+        }
+        // HTML as readable text: links as "text (url)", block ends as new lines, tags dropped.
+        static fn htmlToText(html: string) -> string {
+            let s = html;
+            let head = Str.indexOf(Str.lower(s), "<body");
+            if (head >= 0) { s = s[Str.indexFrom(s, ">", head) + 1..]; }
+            let sb = new StringBuilder();
+            let i = 0;
+            while (i < s.length) {
+                let c = s[i] as int;
+                if (c == 60) {
+                    let close = Str.indexFrom(s, ">", i);
+                    if (close < 0) { break; }
+                    let tag = Str.lower(s[i + 1..close]);
+                    if (Str.startsWith(tag, "a ") && Str.contains(tag, "href=\"")) {
+                        let href = Text.betweenFirst(s[i + 1..close], "href=\"", "\"");
+                        let end = Str.indexFrom(Str.lower(s), "</a>", close);
+                        let label = end > 0 ? Mailer.htmlToText(s[close + 1..end]) : "";
+                        sb.append(label == href || label == "" ? href : label + " (" + href + ")");
+                        i = end > 0 ? end + 4 : close + 1;
+                        continue;
+                    }
+                    if (Str.startsWith(tag, "style") || Str.startsWith(tag, "script") || Str.startsWith(tag, "title")) {
+                        let name = Str.startsWith(tag, "style") ? "style" : (Str.startsWith(tag, "script") ? "script" : "title");
+                        let end = Str.indexFrom(Str.lower(s), "</" + name + ">", close);
+                        i = end > 0 ? end + name.length + 3 : close + 1;
+                        continue;
+                    }
+                    if (tag == "br" || tag == "br/" || tag == "br /" || Str.startsWith(tag, "/p") || Str.startsWith(tag, "/h") || Str.startsWith(tag, "/li") || Str.startsWith(tag, "/tr") || Str.startsWith(tag, "/div") || Str.startsWith(tag, "/table")) { sb.append("\n"); }
+                    if (Str.startsWith(tag, "li")) { sb.append("- "); }
+                    i = close + 1;
+                    continue;
+                }
+                sb.appendChar(c);
+                i += 1;
+            }
+            let t = Str.replace(Str.replace(Str.replace(Str.replace(Str.replace(sb.toString(), "&nbsp;", " "), "&lt;", "<"), "&gt;", ">"), "&quot;", "\""), "&amp;", "&");
+            let lines = new Array<string>();
+            let blank = false;
+            for (l in Str.lines(t)) {
+                let x = Text.squish(l);
+                if (x == "") { if (!blank && lines.size() > 0) { lines.push(""); } blank = true; continue; }
+                lines.push(x);
+                blank = false;
+            }
+            return Str.trim(Str.join(lines, "\n"));
+        }
+        static fn emails(list: Array<Address>) -> Array<string> { let out = new Array<string>(); for (a in list) { out.push(a.email); } return out; }
+
+        // ── testing ────────────────────────────────────────────────────────────
+        fn fake() { self.faking = true; self.sentMails = new Array<Mailable>(); self.queuedMails = new Array<Mailable>(); }
+        fn sentOf<M>() -> Array<M> { let out = new Array<M>(); for (m in self.sentMails) { if (ClassInfo.of(m).name == nameof(M)) { out.push(m as M); } } return out; }
+        fn queuedOf<M>() -> Array<M> { let out = new Array<M>(); for (m in self.queuedMails) { if (ClassInfo.of(m).name == nameof(M)) { out.push(m as M); } } return out; }
+        fn assertSent<M>(check: fn(M) -> bool = null, times: int = -1) {
+            let hits = 0;
+            for (m in self.sentOf::<M>()) { if (check == null || check(m)) { hits += 1; } }
+            if (times < 0 && hits == 0) { throw new AssertionError("expected a " + nameof(M) + " to be sent" + (check == null ? "" : " that matches") + "; none was"); }
+            if (times >= 0 && hits != times) { throw new AssertionError("expected " + nameof(M) + " sent ${times} time(s), got ${hits}"); }
+        }
+        fn assertNotSent<M>() { if (self.sentOf::<M>().size() > 0) { throw new AssertionError("expected no " + nameof(M) + " to be sent"); } }
+        fn assertQueued<M>(check: fn(M) -> bool = null) {
+            for (m in self.queuedOf::<M>()) { if (check == null || check(m)) { return; } }
+            throw new AssertionError("expected a " + nameof(M) + " to be queued; none was");
+        }
+        fn assertNotQueued<M>() { if (self.queuedOf::<M>().size() > 0) { throw new AssertionError("expected no " + nameof(M) + " to be queued"); } }
+        fn assertNothingSent() { if (self.sentMails.size() > 0) { throw new AssertionError("expected no mail sent; ${self.sentMails.size()} were"); } }
+        fn assertNothingQueued() { if (self.queuedMails.size() > 0) { throw new AssertionError("expected no mail queued; ${self.queuedMails.size()} were"); } }
+        fn assertSentCount(n: int) { if (self.sentMails.size() != n) { throw new AssertionError("expected ${n} mail(s) sent, got ${self.sentMails.size()}"); } }
+    }
+
+    // mailer.to(…).cc(…).send(m)
+    class PendingMail {
+        private mailer: Mailer
+        private toList: Array<Array<string>>
+        private ccList: Array<string>
+        private bccList: Array<string>
+        constructor(mailer: Mailer) { self.mailer = mailer; self.toList = new Array<Array<string>>(); self.ccList = new Array<string>(); self.bccList = new Array<string>(); }
+        fn to(address: string, name: string = "") -> PendingMail { self.toList.push([address, name]); return self; }
+        fn cc(address: string) -> PendingMail { self.ccList.push(address); return self; }
+        fn bcc(address: string) -> PendingMail { self.bccList.push(address); return self; }
+        private fn fill(m: Mailable) -> Mailable {
+            for (a in self.toList) { m.to(a[0], a[1]); }
+            for (a in self.ccList) { m.cc(a); }
+            for (a in self.bccList) { m.bcc(a); }
+            return m;
+        }
+        fn send(m: Mailable) -> SentMessage { return self.mailer.send(self.fill(m)); }
+        fn queue(m: Mailable) -> string { return self.mailer.queue(self.fill(m)); }
+        fn later(seconds: long, m: Mailable) -> string { return self.mailer.later(seconds, self.fill(m)); }
+    }
+
+    // A mail without a class of its own (mailer.raw).
+    class RawMail extends Mailable { constructor() {} }
+
+    // The mailers an app has, by name (smtp, log, array, …), and the default.
+    class MailManager {
+        public defaultMailer: string = "smtp"
+        private mailers: HashMap<string, Mailer>
+        constructor() { self.mailers = new HashMap<string, Mailer>(); }
+        fn add(m: Mailer) -> MailManager { self.mailers.put(m.name, m); if (self.mailers.size() == 1) { self.defaultMailer = m.name; } return self; }
+        fn mailer(name: string = "") -> Mailer {
+            let n = name == "" ? self.defaultMailer : name;
+            let m = self.mailers.getOr(n, null);
+            if (m == null) { throw new MailException("no mailer called '" + n + "'"); }
+            return m;
+        }
+        fn to(address: string, name: string = "") -> PendingMail { return self.mailer().to(address, name); }
+        fn send(m: Mailable) -> SentMessage { return self.mailer(m.mailerName).send(m); }
+        fn queue(m: Mailable) -> string { return self.mailer(m.mailerName).queue(m); }
+        fn names() -> Array<string> { let k = self.mailers.keys(); Sort.sort(k); return k; }
+    }
+
+    // A mailable sent from a worker.
+    class SendQueuedMailable extends Job {
+        public mailable: Mailable = null
+        public mailerName: string = ""
+        constructor() { self.tries = 3; self.backoff = [10, 60] }
+        fn displayName() -> string { return self.mailable == null ? "SendQueuedMailable" : ClassInfo.of(self.mailable).name; }
+        fn handle(mail: MailManager) { mail.mailer(self.mailerName).send(self.mailable); }
+    }
+}
