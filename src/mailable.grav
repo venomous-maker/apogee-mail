@@ -1,0 +1,326 @@
+// mailable.grav — Mailable: one kind of email the app sends, as a class
+// (Laravel's mailables): who it goes to, its subject, its body (a view, HTML,
+// text, or Markdown in the mail theme), attachments, tags and headers.
+//
+//   class OrderShipped extends Mailable {
+//       public orderId: long = 0
+//       constructor(orderId: long = 0) { self.orderId = orderId }
+//       fn build() {
+//           self.subject("Your order #${self.orderId} has shipped")
+//               .markdown("# On its way!\n\nOrder **#${self.orderId}** left the warehouse.\n\n@button(https://shop.test/orders/${self.orderId})Track it@endbutton")
+//               .attach("/var/invoices/${self.orderId}.pdf")
+//       }
+//   }
+//   mailer.to("ada@example.com").send(new OrderShipped(42))
+import "std"
+import "std/net"
+import "apogee-support"
+import "markdown.grav"
+
+namespace apogee {
+
+    // "Ada Lovelace <ada@example.com>" as its two parts.
+    @MailPart class Address {
+        public email: string = ""
+        public name: string = ""
+        constructor(email: string = "", name: string = "") { self.email = email; self.name = name; }
+        // Reads "Name <email>", "<email>" or "email".
+        static fn parse(text: string) -> Address {
+            let t = Str.trim(text);
+            let lt = Str.lastIndexOf(t, "<");
+            if (lt >= 0 && Str.endsWith(t, ">")) {
+                let name = Str.trim(t[..lt]);
+                if (Str.startsWith(name, "\"") && Str.endsWith(name, "\"") && name.length >= 2) { name = name[1..name.length - 1]; }
+                return new Address(Str.trim(t[lt + 1..t.length - 1]), name);
+            }
+            return new Address(t, "");
+        }
+        fn isValid() -> bool {
+            let at = Str.indexOf(self.email, "@");
+            return at > 0 && at < self.email.length - 1 && !Str.contains(self.email, " ") && Str.contains(self.email[at..], ".");
+        }
+        fn toString() -> string {
+            if (self.name == "") { return self.email; }
+            let plain = true;
+            for (i in 0..self.name.length) { let c = self.name[i] as int; if (c == 44 || c == 34 || c == 60 || c == 62 || c == 64 || c == 59 || c == 58) { plain = false; } }
+            return (plain ? self.name : "\"" + Str.replace(self.name, "\"", "\\\"") + "\"") + " <" + self.email + ">";
+        }
+    }
+
+    // A file sent with the mail: from a path (read when it is sent) or its data.
+    @MailPart class Attachment {
+        public path: string = ""
+        public filename: string = ""
+        public mime: string = ""
+        // The data, base64 (attachData).
+        public data64: string = ""
+        // Shown in the body rather than offered as a file (images the HTML refers to by cid:).
+        public inline: bool = false
+        constructor(path: string = "", filename: string = "", mime: string = "") { self.path = path; self.filename = filename; self.mime = mime; }
+        fn bytes() -> Bytes {
+            if (self.data64 != "") { return Base64.decodeBytes(self.data64); }
+            return Bytes.fromBinary(new File(self.path).readBinary());
+        }
+        fn name() -> string { return self.filename != "" ? self.filename : Path.basename(self.path); }
+        fn contentType() -> string { return self.mime != "" ? self.mime : Attachment.guess(self.name()); }
+        static fn guess(name: string) -> string {
+            let ext = Str.lower(Path.extension(name));
+            let types: HashMap<string, string> = {".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+                ".svg": "image/svg+xml", ".webp": "image/webp", ".csv": "text/csv", ".txt": "text/plain", ".html": "text/html", ".json": "application/json",
+                ".zip": "application/zip", ".ics": "text/calendar", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".mp4": "video/mp4", ".mp3": "audio/mpeg"};
+            return types.getOr(ext, "application/octet-stream");
+        }
+    }
+
+    // A mail ready for a transport: every part rendered.
+    class RenderedMail {
+        public from: Address = null
+        public to: Array<Address>
+        public cc: Array<Address>
+        public bcc: Array<Address>
+        public replyTo: Array<Address>
+        public subject: string = ""
+        public html: string = ""
+        public text: string = ""
+        public attachments: Array<Attachment>
+        public headers: HashMap<string, string>
+        public tags: Array<string>
+        public metadata: HashMap<string, string>
+        // The mailable's class ("" for a raw mail).
+        public mailable: string = ""
+        constructor() {
+            self.to = new Array<Address>(); self.cc = new Array<Address>(); self.bcc = new Array<Address>(); self.replyTo = new Array<Address>();
+            self.attachments = new Array<Attachment>(); self.headers = new HashMap<string, string>(); self.tags = new Array<string>(); self.metadata = new HashMap<string, string>();
+        }
+        fn allRecipients() -> Array<Address> { let out = self.to.copy(); out.addAll(self.cc); out.addAll(self.bcc); return out; }
+        // As std's EmailMessage (what SMTP sends).
+        fn toEmail() -> EmailMessage {
+            let m = new EmailMessage();
+            if (self.from != null) { m.from(self.from.toString()); }
+            for (a in self.to) { m.to(a.toString()); }
+            for (a in self.cc) { m.cc(a.toString()); }
+            for (a in self.bcc) { m.bcc(a.toString()); }
+            if (self.replyTo.size() > 0) { m.replyTo(self.replyTo[0].toString()); }
+            m.subject(self.subject);
+            if (self.text != "") { m.text(self.text); }
+            if (self.html != "") { m.html(self.html); }
+            for (k in self.headers.keys()) { m.header(k, self.headers[k]); }
+            if (self.tags.size() > 0) { m.header("X-Tags", Str.join(self.tags, ", ")); }
+            for (k in self.metadata.keys()) { m.header("X-Metadata-" + k, self.metadata[k]); }
+            for (a in self.attachments) { m.attach(a.name(), a.contentType(), a.bytes()); }
+            return m;
+        }
+        fn toMime() -> string { return self.toEmail().toMime(); }
+    }
+
+    // The base of every mailable (its decorator gives them reflection: they
+    // travel on queues and the fake can tell them apart).
+    @Mailable abstract class Mailable {
+        // (addresses as text and attachments as Array<any>: what a queue can carry)
+        public fromAddress: string = ""
+        public toList: Array<string>
+        public ccList: Array<string>
+        public bccList: Array<string>
+        public replyToList: Array<string>
+        public subjectLine: string = ""
+        // The body: a view's name (and a plain-text view), raw HTML and text, or Markdown (text or a view).
+        public viewName: string = ""
+        public textViewName: string = ""
+        public htmlBody: string = ""
+        public textBody: string = ""
+        public markdownBody: string = ""
+        public markdownView: string = ""
+        public viewData: HashMap<string, any>
+        public attachmentList: Array<any>
+        public tagList: Array<string>
+        public metadataMap: HashMap<string, string>
+        public headerMap: HashMap<string, string>
+        // For queued sending (mailer.queue()).
+        public queueName: string = ""
+        public connectionName: string = ""
+        public delaySeconds: long = 0
+        // The mailer to send through ("" for the default).
+        public mailerName: string = ""
+        @Transient public built: bool = false
+
+        constructor() {
+            self.toList = new Array<string>(); self.ccList = new Array<string>(); self.bccList = new Array<string>(); self.replyToList = new Array<string>();
+            self.viewData = new HashMap<string, any>(); self.attachmentList = new Array<any>(); self.tagList = new Array<string>();
+            self.metadataMap = new HashMap<string, string>(); self.headerMap = new HashMap<string, string>();
+        }
+        // Fills in the mail (override; its parameters come from the container).
+        fn build() {}
+
+        // ── chained setters ────────────────────────────────────────────────────
+        fn from(address: string, name: string = "") -> Mailable { self.fromAddress = Mailable.addr(address, name); return self; }
+        fn to(address: string, name: string = "") -> Mailable { self.toList.push(Mailable.addr(address, name)); return self; }
+        fn cc(address: string, name: string = "") -> Mailable { self.ccList.push(Mailable.addr(address, name)); return self; }
+        fn bcc(address: string, name: string = "") -> Mailable { self.bccList.push(Mailable.addr(address, name)); return self; }
+        fn replyTo(address: string, name: string = "") -> Mailable { self.replyToList.push(Mailable.addr(address, name)); return self; }
+        private static fn addr(address: string, name: string) -> string { return name == "" ? Address.parse(address).toString() : new Address(address, name).toString(); }
+        static fn addresses(list: Array<string>) -> Array<Address> { let out = new Array<Address>(); for (a in list) { out.push(Address.parse(a)); } return out; }
+        fn attachments() -> Array<Attachment> { let out = new Array<Attachment>(); for (a in self.attachmentList) { out.push(a as Attachment); } return out; }
+        fn subject(text: string) -> Mailable { self.subjectLine = text; return self; }
+        fn view(name: string, data: HashMap<string, any> = new HashMap<string, any>()) -> Mailable { self.viewName = name; self.withAll(data); return self; }
+        fn textView(name: string) -> Mailable { self.textViewName = name; return self; }
+        fn html(body: string) -> Mailable { self.htmlBody = body; return self; }
+        fn text(body: string) -> Mailable { self.textBody = body; return self; }
+        // Markdown in the mail theme (with @button, @panel, @subcopy components); a view when `isView`.
+        fn markdown(source: string, isView: bool = false) -> Mailable { if (isView) { self.markdownView = source; } else { self.markdownBody = source; } return self; }
+        fn with(key: string, value: any) -> Mailable { self.viewData.put(key, value); return self; }
+        fn withAll(data: HashMap<string, any>) -> Mailable { for (k in data.keys()) { self.viewData.put(k, data[k]); } return self; }
+        fn attach(path: string, name: string = "", mime: string = "") -> Mailable { self.attachmentList.push(new Attachment(path, name, mime)); return self; }
+        fn attachData(data: Bytes, name: string, mime: string = "") -> Mailable {
+            let a = new Attachment("", name, mime);
+            a.data64 = Base64.encodeBytes(data);
+            self.attachmentList.push(a);
+            return self;
+        }
+        fn tag(t: string) -> Mailable { self.tagList.push(t); return self; }
+        fn metadata(key: string, value: string) -> Mailable { self.metadataMap.put(key, value); return self; }
+        fn header(name: string, value: string) -> Mailable { self.headerMap.put(name, value); return self; }
+        // 1 (highest) … 5 (lowest).
+        fn priority(level: int) -> Mailable { self.headerMap.put("X-Priority", "${level}"); return self; }
+        fn onQueue(q: string) -> Mailable { self.queueName = q; return self; }
+        fn onConnection(c: string) -> Mailable { self.connectionName = c; return self; }
+        fn delay(seconds: long) -> Mailable { self.delaySeconds = seconds; return self; }
+        fn mailer(name: string) -> Mailable { self.mailerName = name; return self; }
+
+        // ── asking it ───────────────────────────────────────────────────────────
+        fn hasTo(email: string) -> bool { for (a in Mailable.addresses(self.toList)) { if (Str.lower(a.email) == Str.lower(email)) { return true; } } return false; }
+        fn hasCc(email: string) -> bool { for (a in Mailable.addresses(self.ccList)) { if (Str.lower(a.email) == Str.lower(email)) { return true; } } return false; }
+        fn hasBcc(email: string) -> bool { for (a in Mailable.addresses(self.bccList)) { if (Str.lower(a.email) == Str.lower(email)) { return true; } } return false; }
+        fn hasSubject(s: string) -> bool { return self.subjectLine == s; }
+        fn hasAttachment(name: string) -> bool { for (a in self.attachments()) { if (a.name() == name) { return true; } } return false; }
+        fn hasTag(t: string) -> bool { return self.tagList.contains(t); }
+    }
+
+    // The look of Markdown mail: a layout with the body inside, inline CSS
+    // (mail clients ignore <style> sheets), and the components' HTML.
+    class MailTheme {
+        public appName: string = "Apogee"
+        public appUrl: string = ""
+        public accent: string = "#2d3748"
+        public buttonColor: string = "#2563eb"
+        public footer: string = ""
+        constructor() {}
+        // Markdown (with components) rendered into the layout.
+        fn render(markdown: string, subject: string) -> string {
+            let body = Markdown.toHtml(self.components(markdown));
+            body = self.styleTags(body);
+            let footer = self.footer != "" ? self.footer : "© ${Moment.now().year()} " + Markdown.escape(self.appName) + ". All rights reserved.";
+            let header = self.appUrl != "" ? "<a href=\"" + Markdown.escape(self.appUrl) + "\" style=\"color:" + self.accent + ";font-size:19px;font-weight:bold;text-decoration:none;\">" + Markdown.escape(self.appName) + "</a>"
+                                           : "<span style=\"color:" + self.accent + ";font-size:19px;font-weight:bold;\">" + Markdown.escape(self.appName) + "</span>";
+            return "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>" + Markdown.escape(subject) + "</title></head>\n" +
+                   "<body style=\"margin:0;padding:0;background:#edf2f7;font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#2d3748;\">\n" +
+                   "<table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" role=\"presentation\"><tr><td align=\"center\" style=\"padding:25px 0;\">" + header + "</td></tr>\n" +
+                   "<tr><td align=\"center\"><table width=\"570\" cellpadding=\"0\" cellspacing=\"0\" role=\"presentation\" style=\"background:#ffffff;border-radius:4px;\"><tr><td style=\"padding:32px;font-size:16px;line-height:1.5;\">\n" +
+                   body + "\n</td></tr></table></td></tr>\n" +
+                   "<tr><td align=\"center\" style=\"padding:32px;color:#b0adc5;font-size:12px;\">" + footer + "</td></tr></table>\n</body></html>";
+        }
+        // @button(url, color)Label@endbutton, @panel…@endpanel, @subcopy…@endsubcopy.
+        fn components(source: string) -> string {
+            let s = source;
+            while (Str.contains(s, "@button(")) {
+                let at = Str.indexOf(s, "@button(");
+                let close = Str.indexFrom(s, ")", at);
+                let end = Str.indexFrom(s, "@endbutton", close);
+                if (close < 0 || end < 0) { break; }
+                let args = Str.split(s[at + 8..close], ",");
+                let url = Str.trim(args[0]);
+                let color = args.size() > 1 ? Str.trim(args[1]) : "";
+                let bg = color == "success" || color == "green" ? "#16a34a" : (color == "error" || color == "red" ? "#dc2626" : self.buttonColor);
+                let label = Str.trim(s[close + 1..end]);
+                let html = "\n\n<table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" role=\"presentation\"><tr><td align=\"center\" style=\"padding:16px 0;\">" +
+                           "<a href=\"" + Markdown.escape(url) + "\" style=\"background:" + bg + ";border-radius:4px;color:#ffffff;display:inline-block;padding:10px 18px;text-decoration:none;font-weight:600;\">" +
+                           Markdown.inline(label) + "</a></td></tr></table>\n\n";
+                s = s[..at] + html + s[end + 10..];
+            }
+            s = self.wrap(s, "@panel", "@endpanel", "<table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" role=\"presentation\" style=\"border-left:#2d3748 solid 4px;margin:21px 0;\"><tr><td style=\"background:#edf2f7;padding:16px;\">", "</td></tr></table>");
+            s = self.wrap(s, "@subcopy", "@endsubcopy", "<table width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" role=\"presentation\" style=\"border-top:1px solid #e8e5ef;margin-top:25px;padding-top:25px;\"><tr><td style=\"font-size:14px;\">", "</td></tr></table>");
+            return s;
+        }
+        private fn wrap(source: string, open: string, close: string, before: string, after: string) -> string {
+            let s = source;
+            while (Str.contains(s, open)) {
+                let at = Str.indexOf(s, open);
+                let end = Str.indexFrom(s, close, at);
+                if (end < 0) { break; }
+                let inner = Markdown.toHtml(Str.trim(s[at + open.length..end]));
+                s = s[..at] + "\n\n" + before + inner + after + "\n\n" + s[end + close.length..];
+            }
+            return s;
+        }
+        // Inline styles on the tags Markdown makes.
+        private fn styleTags(html: string) -> string {
+            let h = html;
+            h = Str.replace(h, "<h1>", "<h1 style=\"color:" + self.accent + ";font-size:18px;font-weight:bold;margin-top:0;\">");
+            h = Str.replace(h, "<h2>", "<h2 style=\"color:" + self.accent + ";font-size:16px;font-weight:bold;\">");
+            h = Str.replace(h, "<h3>", "<h3 style=\"color:" + self.accent + ";font-size:14px;font-weight:bold;\">");
+            h = Str.replace(h, "<p>", "<p style=\"margin:0 0 16px;\">");
+            h = Str.replace(h, "<a href=", "<a style=\"color:#3869d4;\" href=");
+            h = Str.replace(h, "<table>", "<table width=\"100%\" style=\"border-collapse:collapse;margin:16px 0;\">");
+            h = Str.replace(h, "<th", "<th style=\"border-bottom:1px solid #edeff2;padding:8px 0;text-align:left;\"");
+            h = Str.replace(h, "<td>", "<td style=\"padding:8px 0;\">");
+            h = Str.replace(h, "<code>", "<code style=\"background:#f1f5f9;border-radius:3px;padding:1px 4px;font-size:90%;\">");
+            return h;
+        }
+        // The plain-text part of Markdown mail.
+        fn text(markdown: string) -> string {
+            let s = markdown;
+            while (Str.contains(s, "@button(")) {
+                let at = Str.indexOf(s, "@button(");
+                let close = Str.indexFrom(s, ")", at);
+                let end = Str.indexFrom(s, "@endbutton", close);
+                if (close < 0 || end < 0) { break; }
+                let url = Str.trim(Str.split(s[at + 8..close], ",")[0]);
+                s = s[..at] + Str.trim(s[close + 1..end]) + ": " + url + s[end + 10..];
+            }
+            for (tag in ["@panel", "@endpanel", "@subcopy", "@endsubcopy"]) { s = Str.replace(s, tag, ""); }
+            return Markdown.toText(s);
+        }
+    }
+
+    // A notification's mail, built line by line (Laravel's MailMessage):
+    //   new MailMessage().subject("Invoice paid").greeting("Hi Ada,").line("We got your payment.").action("View invoice", url).line("Thanks!")
+    @MailPart class MailMessage {
+        public subjectLine: string = ""
+        public greetingLine: string = ""
+        public salutationLine: string = ""
+        public lines: Array<string>
+        public outroLines: Array<string>
+        public actionText: string = ""
+        public actionUrl: string = ""
+        // "primary", "success" or "error".
+        public level: string = "primary"
+        public attachmentList: Array<Attachment>
+        public ccList: Array<string>
+        constructor() { self.lines = new Array<string>(); self.outroLines = new Array<string>(); self.attachmentList = new Array<Attachment>(); self.ccList = new Array<string>(); }
+        fn subject(s: string) -> MailMessage { self.subjectLine = s; return self; }
+        fn greeting(s: string) -> MailMessage { self.greetingLine = s; return self; }
+        fn salutation(s: string) -> MailMessage { self.salutationLine = s; return self; }
+        // A paragraph (before the action, or after it once one is set).
+        fn line(s: string) -> MailMessage { if (self.actionText == "") { self.lines.push(s); } else { self.outroLines.push(s); } return self; }
+        fn action(text: string, url: string) -> MailMessage { self.actionText = text; self.actionUrl = url; return self; }
+        fn success() -> MailMessage { self.level = "success"; return self; }
+        fn error() -> MailMessage { self.level = "error"; return self; }
+        fn attach(path: string, name: string = "") -> MailMessage { self.attachmentList.push(new Attachment(path, name, "")); return self; }
+        fn cc(address: string) -> MailMessage { self.ccList.push(address); return self; }
+        // As Markdown for the theme.
+        fn toMarkdown(appName: string) -> string {
+            let sb = new StringBuilder();
+            sb.append("# ").append(self.greetingLine != "" ? self.greetingLine : (self.level == "error" ? "Whoops!" : "Hello!")).append("\n\n");
+            for (l in self.lines) { sb.append(l).append("\n\n"); }
+            if (self.actionText != "") {
+                sb.append("@button(" + self.actionUrl + (self.level == "primary" ? "" : ", " + self.level) + ")" + self.actionText + "@endbutton\n\n");
+            }
+            for (l in self.outroLines) { sb.append(l).append("\n\n"); }
+            sb.append(self.salutationLine != "" ? self.salutationLine : "Regards,  \n" + appName).append("\n\n");
+            if (self.actionText != "") {
+                sb.append("@subcopy\nIf the \"" + self.actionText + "\" button doesn't work, copy this URL into your browser: [" + self.actionUrl + "](" + self.actionUrl + ")\n@endsubcopy\n");
+            }
+            return sb.toString();
+        }
+    }
+}
