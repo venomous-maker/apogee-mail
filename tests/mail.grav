@@ -1,0 +1,232 @@
+// apogee-mail's tests: Markdown, addresses, mailables (views, Markdown in the
+// theme, HTML, text, attachments, MIME), transports (array, log, failover,
+// round robin, SMTP against a tiny local server), queued mail, the fake, and
+// notifications (mail, database, log, custom channels, queued, anonymous).
+import "std"
+import "std/net"
+import "../src/all.grav"
+use apogee.*
+
+class OrderShipped extends Mailable {
+    public orderId: long = 0
+    constructor(orderId: long = 0) { self.orderId = orderId }
+    fn build() {
+        self.subject("Order #${self.orderId} shipped")
+            .markdown("# On its way!\n\nOrder **#${self.orderId}** left the warehouse.\n\n@button(https://shop.test/orders/${self.orderId})Track it@endbutton\n\n@panel\nKeep this mail.\n@endpanel")
+            .tag("orders").metadata("order", "${self.orderId}")
+    }
+}
+class Welcome extends Mailable {
+    public name: string = ""
+    constructor(name: string = "") { self.name = name }
+    fn build() { self.subject("Welcome").view("mail.welcome", {"name": self.name}).textView("mail.welcome_text") }
+}
+class Invoice extends Mailable {
+    constructor() {}
+    fn build() {
+        self.subject("Invoice").html("<h1>Invoice</h1><p>Total: <b>$10</b>. <a href=\"https://x.io/pay\">Pay now</a></p>")
+            .attachData(Bytes.fromString("a,b\n1,2\n"), "invoice.csv").priority(1)
+    }
+}
+
+@App class User implements Notifiable {
+    public id: long = 0
+    public email: string = ""
+    constructor(id: long = 0, email: string = "") { self.id = id; self.email = email }
+    fn routeNotificationFor(channel: string) -> string { return channel == "mail" ? self.email : (channel == "sms" ? "+254700000${self.id}" : "") }
+    fn notifiableKey() -> string { return "User:${self.id}" }
+}
+class InvoicePaid extends Notification {
+    public amount: long = 0
+    constructor(amount: long = 0) { self.amount = amount }
+    fn via(n: Notifiable) -> Array<string> { return ["mail", "database", "log", "sms"] }
+    fn toMail(n: Notifiable) -> MailMessage {
+        return new MailMessage().subject("Payment received").greeting("Hi!").line("We got ${self.amount} KES.").action("View receipt", "https://x.io/r").line("Thanks for your business.")
+    }
+    fn toArray(n: Notifiable) -> HashMap<string, any> { return {"amount": self.amount} }
+}
+
+class Outbox { static sms: Array<string> = new Array<string>() }
+
+fn views() -> ViewFactory {
+    let dir = Path.combine(Dir.temp(), "apogee-mail-views/mail")
+    Dir.create(dir)
+    new File(dir + "/welcome.tpl.html").write("<p>Hello {{ name }}!</p>")
+    new File(dir + "/welcome_text.tpl.html").write("Hello {{ name }}!")
+    return new ViewFactory([Path.combine(Dir.temp(), "apogee-mail-views")])
+}
+fn mailer(t: MailTransport) -> Mailer {
+    let c = new Container()
+    let m = new Mailer("test", t, c)
+    m.alwaysFrom = Address.parse("Shop <hello@shop.test>")
+    m.theme.appName = "Shop"
+    m.views = views()
+    let manager = new MailManager()
+    manager.add(m)
+    c.instance::<MailManager>(manager)
+    return m
+}
+
+test "markdown: blocks and inline" {
+    let html = Markdown.toHtml("# Title\n\nSome **bold** and *em*, `code` & <b>tags</b>.\n\n- a\n- b\n\n1. one\n\n> quote\n\n| A | B |\n|---|--:|\n| 1 | 2 |")
+    assertEq(Str.contains(html, "<h1>Title</h1>") && Str.contains(html, "<strong>bold</strong> and <em>em</em>, <code>code</code> &amp; <b>tags</b>."), true)
+    assertEq(Str.contains(html, "<ul>\n<li>a</li>\n<li>b</li>\n</ul>\n<ol>\n<li>one</li>\n</ol>"), true)
+    assertEq(Str.contains(html, "<blockquote>\n<p>quote</p>\n</blockquote>") && Str.contains(html, "<td style=\"text-align: right\">2</td>"), true)
+    assertEq(Markdown.toHtml("[a](https://x.io) ![i](/p.png) <https://y.io>"), "<p><a href=\"https://x.io\">a</a> <img src=\"/p.png\" alt=\"i\"> <a href=\"https://y.io\">https://y.io</a></p>")
+    assertEq(Markdown.toText("# Hi\n\nSee [docs](https://x.io) and **this**."), "Hi\n\nSee docs (https://x.io) and this.")
+}
+
+test "addresses" {
+    let a = Address.parse("Ada Lovelace <ada@example.com>")
+    assertEq("${a.name}|${a.email}|${a.isValid()}|${a}", "Ada Lovelace|ada@example.com|true|Ada Lovelace <ada@example.com>")
+    assertEq("${Address.parse("bob@x.io").toString()} ${Address.parse("\"Doe, J\" <j@x.io>").name} ${new Address("j@x.io", "Doe, J")}", "bob@x.io Doe, J \"Doe, J\" <j@x.io>")
+    assertEq(Address.parse("not an address").isValid(), false)
+}
+
+test "mailables render: Markdown in the theme, views, HTML, attachments, MIME" {
+    let t = new ArrayTransport()
+    let m = mailer(t)
+    m.to("ada@example.com", "Ada").send(new OrderShipped(42))
+    let r = t.messages()[0]
+    assertEq("${r.subject}|${r.from}|${r.to[0]}|${r.tags}|${r.metadata["order"]}", "Order #42 shipped|Shop <hello@shop.test>|Ada <ada@example.com>|[\"orders\"]|42")
+    assertEq(Str.contains(r.html, "Order <strong>#42</strong> left the warehouse.") && Str.contains(r.html, "href=\"https://shop.test/orders/42\"") && Str.contains(r.html, ">Track it</a>"), true)
+    assertEq(Str.contains(r.html, "<!DOCTYPE html>") && Str.contains(r.html, "Keep this mail."), true)
+    assertEq(r.text, "On its way!\n\nOrder #42 left the warehouse.\n\nTrack it: https://shop.test/orders/42\n\n\nKeep this mail.")
+    m.to("bob@x.io").send(new Welcome("Bob"))
+    let w = t.messages()[1]
+    assertEq("${w.html}|${w.text}", "<p>Hello Bob!</p>|Hello Bob!")
+    m.to("c@x.io").cc("d@x.io").bcc("e@x.io").send(new Invoice())
+    let inv = t.messages()[2]
+    assertEq("${inv.text}|${inv.attachments[0].name()}|${inv.attachments[0].contentType()}", "Invoice\nTotal: $10. Pay now (https://x.io/pay)|invoice.csv|text/csv")
+    let mime = inv.toMime()
+    assertEq(Str.contains(mime, "Subject: Invoice") && Str.contains(mime, "Cc: d@x.io") && !Str.contains(mime, "Bcc:") && Str.contains(mime, "X-Priority: 1") && Str.contains(mime, "invoice.csv"), true)
+    m.alwaysTo = Address.parse("dev@shop.test")
+    m.to("customer@x.io").send(new Invoice())
+    assertEq(t.messages()[3].to[0].email, "dev@shop.test")
+    let caught = ""
+    try { mailer(new ArrayTransport()).send(new Invoice()) } catch (e: MailException) { caught = e.message() }
+    assertEq(caught, "Invoice has no recipients")
+}
+
+test "transports: log, failover, round robin, and events that change or cancel mail" {
+    let lines = new Array<string>()
+    let m = mailer(LogTransport.to(fn(s: string) { lines.push(s) }))
+    m.to("ada@x.io").send(new Invoice())
+    assertEq(Str.contains(lines[0], "Mail to ada@x.io: Invoice") && Str.contains(lines[0], "Content-Type: multipart/mixed"), true)
+    let backup = new ArrayTransport()
+    let broken = new SmtpTransport("127.0.0.1", 1)
+    broken.timeoutMs = 500
+    mailer(new FailoverTransport([broken as MailTransport, backup])).to("x@x.io").send(new Invoice())
+    assertEq(backup.messages().size(), 1)
+    let a = new ArrayTransport()
+    let b = new ArrayTransport()
+    let rr = mailer(new RoundRobinTransport([a as MailTransport, b]))
+    for (i in 0..4) { rr.to("x@x.io").send(new Invoice()) }
+    assertEq("${a.messages().size()} ${b.messages().size()}", "2 2")
+    let t = new ArrayTransport()
+    let ev = mailer(t)
+    ev.events = new Events()
+    ev.events.listen::<MessageSending>(fn(e: MessageSending) {
+        if (e.mail.subject == "Invoice") { e.cancel() } else { e.mail.subject = "[test] " + e.mail.subject }
+    })
+    ev.to("x@x.io").send(new Invoice())
+    ev.to("x@x.io").send(new Welcome("Z"))
+    assertEq("${t.messages().size()} ${t.messages()[0].subject}", "1 [test] Welcome")
+}
+
+test "SMTP against a local server" {
+    let server = TcpListener.bind("127.0.0.1", 0)
+    let port = server.port()
+    let received = new Array<string>()
+    let th = Thread.spawn(fn() {
+        let c = server.accept()
+        c.write("220 test ESMTP\r\n")
+        let inData = false
+        let data = new StringBuilder()
+        while (true) {
+            let line = c.readLine()
+            if (line == "" && c.eof()) { break }
+            if (inData) {
+                if (line == ".") { inData = false; received.push(data.toString()); c.write("250 queued\r\n"); continue }
+                data.append(line).append("\n")
+                continue
+            }
+            let up = Str.upper(line)
+            if (Str.startsWith(up, "EHLO")) { c.write("250-test\r\n250 8BITMIME\r\n") }
+            else if (Str.startsWith(up, "DATA")) { inData = true; c.write("354 go\r\n") }
+            else if (Str.startsWith(up, "QUIT")) { c.write("221 bye\r\n"); break }
+            else { received.push(line); c.write("250 ok\r\n") }
+        }
+        c.close()
+    })
+    let t = SmtpTransport.fromUrl("smtp://127.0.0.1:${port}?security=none")
+    let id = mailer(t).to("ada@x.io").send(new OrderShipped(7)).id
+    th.join()
+    server.close()
+    assertEq(received[0], "MAIL FROM:<hello@shop.test>")
+    assertEq(received[1], "RCPT TO:<ada@x.io>")
+    assertEq(Str.contains(received[2], "Subject: Order #7 shipped") && Str.contains(received[2], "Message-ID: " + id), true)
+}
+
+test "queued mail is sent by a worker; the fake records" {
+    let t = new ArrayTransport()
+    let m = mailer(t)
+    let q = new QueueManager(m.container)
+    q.addConnection("memory", new MemoryQueueDriver())
+    q.defaultConnection = "memory"
+    m.queueManager = q
+    m.to("ada@x.io").queue(new OrderShipped(9).onQueue("mail"))
+    assertEq("${t.messages().size()} ${q.size("mail")}", "0 1")
+    let o = new WorkerOptions(); o.stopWhenEmpty = true; o.memoryMb = 0; o.sleep = 0.01
+    q.worker().work("memory", ["mail"], o)
+    assertEq("${t.messages().size()} ${t.messages()[0].subject} ${t.messages()[0].to[0].email}", "1 Order #9 shipped ada@x.io")
+    m.fake()
+    m.to("bob@x.io").send(new OrderShipped(1))
+    m.to("bob@x.io").queue(new Welcome("Bob"))
+    m.assertSent::<OrderShipped>(fn(x: OrderShipped) -> bool { return x.hasTo("bob@x.io") && x.orderId == 1 && x.hasSubject("Order #1 shipped") })
+    m.assertSent::<OrderShipped>(null, 1)
+    m.assertQueued::<Welcome>()
+    m.assertNotSent::<Invoice>()
+    let failed = false
+    try { m.assertNothingSent() } catch (e: AssertionError) { failed = true }
+    assertEq("${failed} ${t.messages().size()}", "true 1")
+}
+
+test "notifications: mail, database inbox, log, custom channels, queued, anonymous, fake" {
+    let t = new ArrayTransport()
+    let m = mailer(t)
+    let sender = new NotificationSender()
+    sender.mailer = m
+    let logged = new Array<string>()
+    sender.log = fn(line: string) { logged.push(line) }
+    sender.extend("sms", fn(n: Notifiable, x: Notification) { Outbox.sms.push(n.routeNotificationFor("sms") + ": paid") })
+    let ada = new User(1, "ada@x.io")
+    sender.send(ada, new InvoicePaid(500))
+    let mail = t.messages()[0]
+    assertEq("${mail.subject} ${mail.to[0].email}", "Payment received ada@x.io")
+    assertEq(Str.contains(mail.html, "We got 500 KES.") && Str.contains(mail.html, ">View receipt</a>") && Str.contains(mail.html, "copy this URL into your browser"), true)
+    let inbox = sender.store.forNotifiable("User:1")
+    assertEq("${inbox.size()} ${inbox[0].type} ${inbox[0].data["amount"]} ${sender.store.unreadCount("User:1")}", "1 InvoicePaid 500 1")
+    assertEq("${sender.store.markAsRead(inbox[0].id)} ${sender.store.unreadCount("User:1")}", "true 0")
+    assertEq("${Str.contains(logged[0], "InvoicePaid to User:1: {\"amount\":500}")} ${Outbox.sms[0]}", "true +2547000001: paid")
+    sender.route("mail", "ops@x.io").route("sms", "")
+    let anon = sender.route("mail", "ops@x.io")
+    sender.sendNow(anon, new InvoicePaid(1))
+    assertEq(t.messages()[1].to[0].email, "ops@x.io")
+    // queued
+    let q = new QueueManager(m.container)
+    q.addConnection("memory", new MemoryQueueDriver())
+    q.defaultConnection = "memory"
+    m.container.instance::<NotificationSender>(sender)
+    sender.queueManager = q
+    sender.send(ada, new InvoicePaid(7).onQueue("notifications"))
+    assertEq(q.size("notifications"), 1)
+    let o = new WorkerOptions(); o.stopWhenEmpty = true; o.memoryMb = 0; o.sleep = 0.01
+    q.worker().work("memory", ["notifications"], o)
+    assertEq("${t.messages().size()} ${sender.store.forNotifiable("User:1").size()}", "3 2")
+    sender.fake()
+    sender.send(ada, new InvoicePaid(3))
+    sender.assertSentTo::<InvoicePaid>(ada, fn(x: InvoicePaid) -> bool { return x.amount == 3 })
+    sender.assertNotSentTo::<InvoicePaid>(new User(2, "b@x.io"))
+    sender.assertCount(1)
+}
