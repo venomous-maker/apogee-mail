@@ -1,0 +1,9 @@
+// apogee-mail: mail and notifications. Markdown, mailables and the mail
+// theme, transports (SMTP, log, array, sendmail, failover, round robin),
+// mailers (now, queued, faked), and notifications over mail, database, log
+// and your own channels.
+import "markdown.grav"
+import "mailable.grav"
+import "transports.grav"
+import "mailer.grav"
+import "notifications.grav"

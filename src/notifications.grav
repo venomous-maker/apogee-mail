@@ -1,0 +1,301 @@
+// notifications.grav — notifications: one message to a user (or anyone
+// notifiable) over the channels it chooses: mail, database (an in-app
+// inbox), log, or channels of your own; now or on the queue.
+//
+//   class InvoicePaid extends Notification {
+//       public invoiceId: long = 0
+//       constructor(invoiceId: long = 0) { self.invoiceId = invoiceId }
+//       fn via(n: Notifiable) -> Array<string> { return ["mail", "database"] }
+//       fn toMail(n: Notifiable) -> MailMessage { return new MailMessage().subject("Invoice paid").line("Thanks!").action("View", "https://x.io/i/${self.invoiceId}") }
+//       fn toDatabase(n: Notifiable) -> HashMap<string, any> { return {"invoice": self.invoiceId} }
+//   }
+//   notifications.send(user, new InvoicePaid(7))
+//   notifications.route("mail", "ops@example.com").notify(new ServerDown())     // without a user
+import "std"
+import "apogee-support"
+import "apogee-queue"
+import "grav-db"
+import "mailable.grav"
+import "mailer.grav"
+
+namespace apogee {
+
+    // Someone notifications can reach.
+    interface Notifiable {
+        // Where a channel sends: "mail" -> an address; your channels, what they need.
+        fn routeNotificationFor(channel: string) -> string
+        // Who they are, for stored notifications ("app.User:7").
+        fn notifiableKey() -> string
+    }
+
+    // The base of every notification (its decorator gives them reflection: they travel on queues).
+    @Notice abstract class Notification {
+        // A stable id (set when it is sent).
+        public id: string = ""
+        // Send from a worker instead of now (when the sender has a queue).
+        public queued: bool = false
+        public queueName: string = ""
+        public delaySeconds: long = 0
+        // The channels it goes over for this notifiable.
+        fn via(n: Notifiable) -> Array<string> { return ["mail"]; }
+        fn toMail(n: Notifiable) -> MailMessage { return null; }
+        // What the database channel stores.
+        fn toDatabase(n: Notifiable) -> HashMap<string, any> { return self.toArray(n); }
+        fn toArray(n: Notifiable) -> HashMap<string, any> { return new HashMap<string, any>(); }
+        // The type stored with it ("" for its class name).
+        fn databaseType() -> string { return ""; }
+        // Whether to send it at all (checked just before, on the worker too).
+        fn shouldSend(n: Notifiable, channel: string) -> bool { return true; }
+        fn onQueue(q: string) -> Notification { self.queued = true; self.queueName = q; return self; }
+        fn delay(seconds: long) -> Notification { self.queued = true; self.delaySeconds = seconds; return self; }
+    }
+
+    // A notifiable with routes given by hand (notifications.route(...)).
+    @Notice class AnonymousNotifiable implements Notifiable {
+        public routes: HashMap<string, string>
+        constructor() { self.routes = new HashMap<string, string>(); }
+        fn route(channel: string, to: string) -> AnonymousNotifiable { self.routes.put(channel, to); return self; }
+        fn routeNotificationFor(channel: string) -> string { return self.routes.getOr(channel, ""); }
+        fn notifiableKey() -> string { return "anonymous"; }
+    }
+
+    // A notification as the database channel keeps it.
+    class StoredNotification {
+        public id: string
+        public type: string
+        public notifiable: string
+        public data: HashMap<string, any>
+        public createdAt: long
+        public readAt: long = 0
+        constructor(id: string, kind: string, notifiable: string, data: HashMap<string, any>, createdAt: long) { self.id = id; self.type = kind; self.notifiable = notifiable; self.data = data; self.createdAt = createdAt; }
+        fn isRead() -> bool { return self.readAt > 0; }
+    }
+
+    // Where the database channel keeps notifications.
+    interface NotificationStore {
+        fn store(n: StoredNotification)
+        // A notifiable's notifications, newest first (unread only, when asked).
+        fn forNotifiable(key: string, unreadOnly: bool = false) -> Array<StoredNotification>
+        fn markAsRead(id: string) -> bool
+        fn markAllAsRead(key: string) -> int
+        fn delete(id: string) -> bool
+        fn unreadCount(key: string) -> int { return self.forNotifiable(key, true).size(); }
+    }
+
+    class MemoryNotificationStore implements NotificationStore {
+        private items: Array<StoredNotification>
+        private lock: Mutex
+        constructor() { self.items = new Array<StoredNotification>(); self.lock = new Mutex(); }
+        fn store(n: StoredNotification) { self.lock.lock(); self.items.insert(0, n); self.lock.unlock(); }
+        fn forNotifiable(key: string, unreadOnly: bool = false) -> Array<StoredNotification> {
+            self.lock.lock();
+            let out = new Array<StoredNotification>();
+            for (n in self.items) { if (n.notifiable == key && (!unreadOnly || !n.isRead())) { out.push(n); } }
+            self.lock.unlock();
+            return out;
+        }
+        fn markAsRead(id: string) -> bool {
+            self.lock.lock();
+            let hit = false;
+            for (n in self.items) { if (n.id == id && !n.isRead()) { n.readAt = Time.now(); hit = true; } }
+            self.lock.unlock();
+            return hit;
+        }
+        fn markAllAsRead(key: string) -> int {
+            self.lock.lock();
+            let count = 0;
+            for (n in self.items) { if (n.notifiable == key && !n.isRead()) { n.readAt = Time.now(); count += 1; } }
+            self.lock.unlock();
+            return count;
+        }
+        fn delete(id: string) -> bool {
+            self.lock.lock();
+            let before = self.items.size();
+            let kept = new Array<StoredNotification>();
+            for (n in self.items) { if (n.id != id) { kept.push(n); } }
+            self.items = kept;
+            self.lock.unlock();
+            return kept.size() < before;
+        }
+    }
+
+    // A notifications table, through grav-db (data as JSON).
+    class DatabaseNotificationStore implements NotificationStore {
+        public table: string
+        private pool: Pool
+        constructor(pool: Pool, table: string = "notifications") { self.pool = pool; self.table = table; }
+        fn createTable() {
+            let c = self.pool.acquire();
+            try {
+                c.exec("CREATE TABLE IF NOT EXISTS " + self.table + " (id VARCHAR(64) PRIMARY KEY, type VARCHAR(255) NOT NULL, notifiable VARCHAR(255) NOT NULL, data TEXT NOT NULL, read_at BIGINT NULL, created_at BIGINT NOT NULL)");
+                if (c.driver() != "mysql") { c.exec("CREATE INDEX IF NOT EXISTS " + self.table + "_notifiable_index ON " + self.table + " (notifiable, created_at)"); }
+            } finally { self.pool.release(c); }
+        }
+        fn store(n: StoredNotification) {
+            let c = self.pool.acquire();
+            try { c.execute("INSERT INTO " + self.table + " (id, type, notifiable, data, read_at, created_at) VALUES (?, ?, ?, ?, NULL, ?)", [n.id, n.type, n.notifiable, JobCodec.plainJson(n.data), n.createdAt]); }
+            finally { self.pool.release(c); }
+        }
+        fn forNotifiable(key: string, unreadOnly: bool = false) -> Array<StoredNotification> {
+            let out = new Array<StoredNotification>();
+            let c = self.pool.acquire();
+            try {
+                let sql = "SELECT * FROM " + self.table + " WHERE notifiable = ?" + (unreadOnly ? " AND read_at IS NULL" : "") + " ORDER BY created_at DESC";
+                for (r in c.query(sql, [key]).toArray()) {
+                    let data = JobCodec.plain(Json.parse(r.getString("data")));
+                    let n = new StoredNotification(r.getString("id"), r.getString("type"), r.getString("notifiable"), data is HashMap<string, any> ? data as HashMap<string, any> : new HashMap<string, any>(), r.getInt("created_at"));
+                    if (!r.isNull("read_at")) { n.readAt = r.getInt("read_at"); }
+                    out.push(n);
+                }
+            } finally { self.pool.release(c); }
+            return out;
+        }
+        fn markAsRead(id: string) -> bool {
+            let c = self.pool.acquire();
+            try { return c.execute("UPDATE " + self.table + " SET read_at = ? WHERE id = ? AND read_at IS NULL", [Time.now(), id]) > 0; } finally { self.pool.release(c); }
+            return false;
+        }
+        fn markAllAsRead(key: string) -> int {
+            let c = self.pool.acquire();
+            try { return c.execute("UPDATE " + self.table + " SET read_at = ? WHERE notifiable = ? AND read_at IS NULL", [Time.now(), key]) as int; } finally { self.pool.release(c); }
+            return 0;
+        }
+        fn delete(id: string) -> bool {
+            let c = self.pool.acquire();
+            try { return c.execute("DELETE FROM " + self.table + " WHERE id = ?", [id]) > 0; } finally { self.pool.release(c); }
+            return false;
+        }
+        fn unreadCount(key: string) -> int {
+            let c = self.pool.acquire();
+            try { return Integer.parseOr(str(c.queryValue("SELECT COUNT(*) FROM " + self.table + " WHERE notifiable = ? AND read_at IS NULL", [key])), 0) as int; } finally { self.pool.release(c); }
+            return 0;
+        }
+    }
+
+    // A notification was sent (or failed) over one channel.
+    class NotificationSent { public channel: string  public notification: string  public notifiable: string
+        constructor(channel: string, notification: string, notifiable: string) { self.channel = channel; self.notification = notification; self.notifiable = notifiable; } }
+    class NotificationFailed { public channel: string  public notification: string  public error: string
+        constructor(channel: string, notification: string, error: string) { self.channel = channel; self.notification = notification; self.error = error; } }
+
+    class NotificationSender {
+        public mailer: Mailer = null
+        public store: NotificationStore
+        public queueManager: QueueManager = null
+        public events: Events = null
+        // Lines of the log channel.
+        public log: fn(string) = null
+        private channels: HashMap<string, fn(Notifiable, Notification)>
+        private faking: bool = false
+        private recorded: Array<Array<any>>
+
+        constructor() {
+            self.store = new MemoryNotificationStore();
+            self.channels = new HashMap<string, fn(Notifiable, Notification)>();
+            self.recorded = new Array<Array<any>>();
+        }
+        // A channel of your own: notifications.extend("sms", fn(n: Notifiable, x: Notification) { … }).
+        fn extend(channel: string, send: fn(Notifiable, Notification)) -> NotificationSender { self.channels.put(channel, send); return self; }
+        // A notifiable with only these routes ("mail" -> an address).
+        fn route(channel: string, to: string) -> AnonymousNotifiable { return new AnonymousNotifiable().route(channel, to); }
+
+        // Sends it to each (on the queue when it asks and there is one).
+        fn send(n: Notifiable, x: Notification) {
+            if (x.id == "") { x.id = Text.orderedUuid(); }
+            if (self.faking) { self.recorded.push([n as any, x as any]); return; }
+            if (x.queued && self.queueManager != null) {
+                let job = new SendQueuedNotification();
+                job.notifiable = n;
+                job.notification = x;
+                if (x.queueName != "") { job.queueName = x.queueName; }
+                job.delaySeconds = x.delaySeconds;
+                self.queueManager.dispatch(job);
+                return;
+            }
+            self.sendNow(n, x);
+        }
+        fn sendAll(list: Array<Notifiable>, x: Notification) { for (n in list) { self.send(n, x); } }
+        // Over every channel, now.
+        fn sendNow(n: Notifiable, x: Notification) {
+            if (x.id == "") { x.id = Text.orderedUuid(); }
+            let name = ClassInfo.of(x).name;
+            for (ch in x.via(n)) {
+                if (!x.shouldSend(n, ch)) { continue; }
+                try {
+                    self.deliver(ch, n, x);
+                    if (self.events != null) { self.events.dispatch(new NotificationSent(ch, name, n.notifiableKey())); }
+                } catch (e: Exception) {
+                    if (self.events != null) { self.events.dispatch(new NotificationFailed(ch, name, e.message())); }
+                    throw e;
+                }
+            }
+        }
+        private fn deliver(channel: string, n: Notifiable, x: Notification) {
+            if (channel == "mail") {
+                let to = n.routeNotificationFor("mail");
+                if (to == "") { return; }
+                let msg = x.toMail(n);
+                if (msg == null) { throw new MailException(ClassInfo.of(x).name + " has no toMail()"); }
+                if (self.mailer == null) { throw new MailException("the mail channel needs a mailer"); }
+                let m = new NotificationMail();
+                m.message = msg;
+                m.appName = self.mailer.theme.appName;
+                m.to(to);
+                for (cc in msg.ccList) { m.cc(cc); }
+                for (a in msg.attachmentList) { m.attachmentList.push(a as any); }
+                self.mailer.send(m);
+                return;
+            }
+            if (channel == "database") {
+                let kind = x.databaseType() != "" ? x.databaseType() : ClassInfo.of(x).name;
+                self.store.store(new StoredNotification(x.id, kind, n.notifiableKey(), x.toDatabase(n), Time.now()));
+                return;
+            }
+            if (channel == "log") {
+                let line = "[" + Moment.now().toDateTimeString() + "] " + ClassInfo.of(x).name + " to " + n.notifiableKey() + ": " + JobCodec.plainJson(x.toArray(n));
+                if (self.log != null) { self.log(line); } else { print(line); }
+                return;
+            }
+            let custom = self.channels.getOr(channel, null);
+            if (custom == null) { throw new StateError("no notification channel called '" + channel + "'"); }
+            custom(n, x);
+        }
+
+        // ── testing ────────────────────────────────────────────────────────────
+        fn fake() { self.faking = true; self.recorded = new Array<Array<any>>(); }
+        fn sentTo<N>(n: Notifiable) -> Array<N> {
+            let out = new Array<N>();
+            for (pair in self.recorded) {
+                if (ClassInfo.of(pair[1]).name == nameof(N) && (pair[0] as Notifiable).notifiableKey() == n.notifiableKey()) { out.push(pair[1] as N); }
+            }
+            return out;
+        }
+        fn assertSentTo<N>(n: Notifiable, check: fn(N) -> bool = null) {
+            for (x in self.sentTo::<N>(n)) { if (check == null || check(x)) { return; } }
+            throw new AssertionError("expected a " + nameof(N) + " sent to " + n.notifiableKey());
+        }
+        fn assertNotSentTo<N>(n: Notifiable) { if (self.sentTo::<N>(n).size() > 0) { throw new AssertionError("expected no " + nameof(N) + " sent to " + n.notifiableKey()); } }
+        fn assertNothingSent() { if (self.recorded.size() > 0) { throw new AssertionError("expected no notifications; ${self.recorded.size()} were sent"); } }
+        fn assertCount(n: int) { if (self.recorded.size() != n) { throw new AssertionError("expected ${n} notification(s), got ${self.recorded.size()}"); } }
+    }
+
+    // A notification's MailMessage as a mailable (the theme renders it).
+    class NotificationMail extends Mailable {
+        public message: MailMessage = null
+        public appName: string = ""
+        constructor() {}
+        fn build() {
+            self.subject(self.message.subjectLine != "" ? self.message.subjectLine : "Notification");
+            self.markdown(self.message.toMarkdown(self.appName));
+        }
+    }
+
+    class SendQueuedNotification extends Job {
+        // (an interface-typed field cannot be filled by reflection: `any`, holding a Notifiable)
+        public notifiable: any = null
+        public notification: Notification = null
+        constructor() { self.tries = 3; self.backoff = [10, 60] }
+        fn displayName() -> string { return self.notification == null ? "SendQueuedNotification" : ClassInfo.of(self.notification).name; }
+        fn handle(sender: NotificationSender) { sender.sendNow(self.notifiable as Notifiable, self.notification); }
+    }
+}
