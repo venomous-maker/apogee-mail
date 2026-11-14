@@ -117,12 +117,11 @@ namespace apogee {
     // The base of every mailable (its decorator gives them reflection: they
     // travel on queues and the fake can tell them apart).
     @Mailable abstract class Mailable {
-        // (addresses as text and attachments as Array<any>: what a queue can carry)
-        public fromAddress: string = ""
-        public toList: Array<string>
-        public ccList: Array<string>
-        public bccList: Array<string>
-        public replyToList: Array<string>
+        public fromAddress: Address = null
+        public toList: Array<Address>
+        public ccList: Array<Address>
+        public bccList: Array<Address>
+        public replyToList: Array<Address>
         public subjectLine: string = ""
         // The body: a view's name (and a plain-text view), raw HTML and text, or Markdown (text or a view).
         public viewName: string = ""
@@ -132,7 +131,7 @@ namespace apogee {
         public markdownBody: string = ""
         public markdownView: string = ""
         public viewData: HashMap<string, any>
-        public attachmentList: Array<any>
+        public attachmentList: Array<Attachment>
         public tagList: Array<string>
         public metadataMap: HashMap<string, string>
         public headerMap: HashMap<string, string>
@@ -145,8 +144,8 @@ namespace apogee {
         @Transient public built: bool = false
 
         constructor() {
-            self.toList = new Array<string>(); self.ccList = new Array<string>(); self.bccList = new Array<string>(); self.replyToList = new Array<string>();
-            self.viewData = new HashMap<string, any>(); self.attachmentList = new Array<any>(); self.tagList = new Array<string>();
+            self.toList = new Array<Address>(); self.ccList = new Array<Address>(); self.bccList = new Array<Address>(); self.replyToList = new Array<Address>();
+            self.viewData = new HashMap<string, any>(); self.attachmentList = new Array<Attachment>(); self.tagList = new Array<string>();
             self.metadataMap = new HashMap<string, string>(); self.headerMap = new HashMap<string, string>();
         }
         // Fills in the mail (override; its parameters come from the container).
@@ -158,9 +157,8 @@ namespace apogee {
         fn cc(address: string, name: string = "") -> Mailable { self.ccList.push(Mailable.addr(address, name)); return self; }
         fn bcc(address: string, name: string = "") -> Mailable { self.bccList.push(Mailable.addr(address, name)); return self; }
         fn replyTo(address: string, name: string = "") -> Mailable { self.replyToList.push(Mailable.addr(address, name)); return self; }
-        private static fn addr(address: string, name: string) -> string { return name == "" ? Address.parse(address).toString() : new Address(address, name).toString(); }
-        static fn addresses(list: Array<string>) -> Array<Address> { let out = new Array<Address>(); for (a in list) { out.push(Address.parse(a)); } return out; }
-        fn attachments() -> Array<Attachment> { let out = new Array<Attachment>(); for (a in self.attachmentList) { out.push(a as Attachment); } return out; }
+        private static fn addr(address: string, name: string) -> Address { return name == "" ? Address.parse(address) : new Address(address, name); }
+        fn attachments() -> Array<Attachment> { return self.attachmentList; }
         fn subject(text: string) -> Mailable { self.subjectLine = text; return self; }
         fn view(name: string, data: HashMap<string, any> = new HashMap<string, any>()) -> Mailable { self.viewName = name; self.withAll(data); return self; }
         fn textView(name: string) -> Mailable { self.textViewName = name; return self; }
@@ -188,9 +186,9 @@ namespace apogee {
         fn mailer(name: string) -> Mailable { self.mailerName = name; return self; }
 
         // ── asking it ───────────────────────────────────────────────────────────
-        fn hasTo(email: string) -> bool { for (a in Mailable.addresses(self.toList)) { if (Str.lower(a.email) == Str.lower(email)) { return true; } } return false; }
-        fn hasCc(email: string) -> bool { for (a in Mailable.addresses(self.ccList)) { if (Str.lower(a.email) == Str.lower(email)) { return true; } } return false; }
-        fn hasBcc(email: string) -> bool { for (a in Mailable.addresses(self.bccList)) { if (Str.lower(a.email) == Str.lower(email)) { return true; } } return false; }
+        fn hasTo(email: string) -> bool { for (a in self.toList) { if (Str.lower(a.email) == Str.lower(email)) { return true; } } return false; }
+        fn hasCc(email: string) -> bool { for (a in self.ccList) { if (Str.lower(a.email) == Str.lower(email)) { return true; } } return false; }
+        fn hasBcc(email: string) -> bool { for (a in self.bccList) { if (Str.lower(a.email) == Str.lower(email)) { return true; } } return false; }
         fn hasSubject(s: string) -> bool { return self.subjectLine == s; }
         fn hasAttachment(name: string) -> bool { for (a in self.attachments()) { if (a.name() == name) { return true; } } return false; }
         fn hasTag(t: string) -> bool { return self.tagList.contains(t); }

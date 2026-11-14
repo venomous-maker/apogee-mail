@@ -242,7 +242,7 @@ namespace apogee {
                 m.appName = self.mailer.theme.appName;
                 m.to(to);
                 for (cc in msg.ccList) { m.cc(cc); }
-                for (a in msg.attachmentList) { m.attachmentList.push(a as any); }
+                m.attachmentList.addAll(msg.attachmentList);
                 self.mailer.send(m);
                 return;
             }

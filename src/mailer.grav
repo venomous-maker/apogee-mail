@@ -115,12 +115,12 @@ namespace apogee {
             self.ensureBuilt(m);
             let r = new RenderedMail();
             r.mailable = ClassInfo.of(m).name;
-            r.from = m.fromAddress != "" ? Address.parse(m.fromAddress) : self.alwaysFrom;
+            r.from = m.fromAddress != null ? m.fromAddress : self.alwaysFrom;
             if (r.from == null) { throw new MailException("the mail has no From address (set the mailer's alwaysFrom)"); }
             if (self.alwaysTo != null) { r.to.push(self.alwaysTo); }
-            else { r.to = Mailable.addresses(m.toList); r.cc = Mailable.addresses(m.ccList); r.bcc = Mailable.addresses(m.bccList); }
+            else { r.to = m.toList.copy(); r.cc = m.ccList.copy(); r.bcc = m.bccList.copy(); }
             if (r.to.size() == 0 && r.cc.size() == 0 && r.bcc.size() == 0) { throw new MailException(r.mailable + " has no recipients"); }
-            if (m.replyToList.size() > 0) { r.replyTo = Mailable.addresses(m.replyToList); }
+            if (m.replyToList.size() > 0) { r.replyTo = m.replyToList.copy(); }
             else if (self.alwaysReplyTo != null) { r.replyTo.push(self.alwaysReplyTo); }
             r.subject = m.subjectLine != "" ? m.subjectLine : Text.headline(ClassInfo.of(m).simpleName());
             let data = new HashMap<string, any>();
@@ -138,7 +138,7 @@ namespace apogee {
                 if (r.text == "") { r.text = self.theme.text(md); }
             }
             if (r.text == "" && r.html != "") { r.text = Mailer.htmlToText(r.html); }
-            r.attachments = m.attachments();
+            r.attachments = m.attachmentList.copy();
             r.headers = m.headerMap;
             r.tags = m.tagList.copy();
             r.metadata = m.metadataMap;
