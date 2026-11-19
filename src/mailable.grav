@@ -105,9 +105,9 @@ namespace apogee {
             m.subject(self.subject);
             if (self.text != "") { m.text(self.text); }
             if (self.html != "") { m.html(self.html); }
-            for (k in self.headers.keys()) { m.header(k, self.headers[k]); }
+            for ((k, v) in self.headers) { m.header(k, v); }
             if (self.tags.size() > 0) { m.header("X-Tags", Str.join(self.tags, ", ")); }
-            for (k in self.metadata.keys()) { m.header("X-Metadata-" + k, self.metadata[k]); }
+            for ((k, v) in self.metadata) { m.header("X-Metadata-" + k, v); }
             for (a in self.attachments) { m.attach(a.name(), a.contentType(), a.bytes()); }
             return m;
         }
@@ -167,7 +167,7 @@ namespace apogee {
         // Markdown in the mail theme (with @button, @panel, @subcopy components); a view when `isView`.
         fn markdown(source: string, isView: bool = false) -> Mailable { if (isView) { self.markdownView = source; } else { self.markdownBody = source; } return self; }
         fn with(key: string, value: any) -> Mailable { self.viewData.put(key, value); return self; }
-        fn withAll(data: HashMap<string, any>) -> Mailable { for (k in data.keys()) { self.viewData.put(k, data[k]); } return self; }
+        fn withAll(data: HashMap<string, any>) -> Mailable { for ((k, v) in data) { self.viewData.put(k, v); } return self; }
         fn attach(path: string, name: string = "", mime: string = "") -> Mailable { self.attachmentList.push(new Attachment(path, name, mime)); return self; }
         fn attachData(data: Bytes, name: string, mime: string = "") -> Mailable {
             let a = new Attachment("", name, mime);

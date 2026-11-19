@@ -124,7 +124,7 @@ namespace apogee {
             else if (self.alwaysReplyTo != null) { r.replyTo.push(self.alwaysReplyTo); }
             r.subject = m.subjectLine != "" ? m.subjectLine : Text.headline(ClassInfo.of(m).simpleName());
             let data = new HashMap<string, any>();
-            for (k in m.viewData.keys()) { data.put(k, m.viewData[k]); }
+            for ((k, v) in m.viewData) { data.put(k, v); }
             data.put("subject", r.subject);
             if (m.viewName != "") { r.html = self.needViews().render(m.viewName, data); }
             else if (m.htmlBody != "") { r.html = m.htmlBody; }
