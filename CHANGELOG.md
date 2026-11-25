@@ -6,6 +6,11 @@ compiler versions it builds with.
 
 ## Unreleased
 
+Needs grav 1.13.0 or newer.
+
+- Markdown comes from std's `Markdown` (std.text), which this package's own
+  converter became; `Markdown.toHtml(text, true)` is the new safe mode.
+
 ## 0.2.2 (2026-11-21)
 
 ### Requirements
