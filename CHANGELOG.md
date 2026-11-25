@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.3.0 (2026-11-25)
+
 Needs grav 1.13.0 or newer.
 
 - Markdown comes from std's `Markdown` (std.text), which this package's own
