@@ -11,7 +11,7 @@ Laravel's:
 - **Notifications:** over mail, a database inbox, a log, or channels of your
   own, sent now or on the queue.
 
-```grav
+```typescript
 import "std"
 import "apogee-mail"
 
@@ -106,7 +106,7 @@ The text part turns a button into `Label: url`.
 
 **Testing:**
 
-```grav
+```typescript
 mailer.fake()
 code.thatSendsMail()
 mailer.assertSent::<OrderShipped>(fn(m: OrderShipped) -> bool { return m.hasTo("ada@example.com") && m.orderId == 42 })
@@ -116,7 +116,7 @@ mailer.assertQueued::<Welcome>()   mailer.assertNotSent::<Invoice>()   mailer.as
 
 ## Notifications
 
-```grav
+```typescript
 class InvoicePaid extends Notification {
     public amount: long = 0
     constructor(amount: long = 0) { self.amount = amount }
