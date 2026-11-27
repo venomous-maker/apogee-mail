@@ -5,10 +5,10 @@ paths = ["src"]
 
 [dependencies]
 apogee-support = "github.com/venomous-maker/apogee-support@v0.2.0"
-apogee-queue = "github.com/venomous-maker/apogee-queue@v0.3.1"
+apogee-queue = "github.com/venomous-maker/apogee-queue@v0.3.2"
 apogee-view = "github.com/venomous-maker/apogee-view@v0.2.1"
 apogee-http = "github.com/venomous-maker/apogee-http@v0.3.0"
 apogee-container = "github.com/venomous-maker/apogee-container@v0.2.0"
 apogee-events = "github.com/venomous-maker/apogee-events@v0.2.0"
-grav-cache = "github.com/venomous-maker/grav-cache@v0.2.2"
-grav-db = "github.com/venomous-maker/grav-db@v0.2.0"
+grav-cache = "github.com/venomous-maker/grav-cache@v0.2.3"
+grav-db = "github.com/venomous-maker/grav-db@v0.2.1"
